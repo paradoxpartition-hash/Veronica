@@ -54,9 +54,16 @@ if (AUTHORIZED_USER) {
   startWatchdog(bot, AUTHORIZED_USER);
 }
 
-bot.launch();
+bot.launch().then(() => {
+  console.log('VERONICA ONLINE');
+  if (AUTHORIZED_USER) {
+    bot.telegram.sendMessage(
+      AUTHORIZED_USER,
+      `*V.E.R.O.N.I.C.A. ONLINE* ✅\n\nSystems restored. Watchdog active. Ready.`,
+      { parse_mode: 'Markdown' }
+    ).catch((err) => console.error('Startup notify failed:', err.message));
+  }
+});
 
 process.once('SIGINT', () => bot.stop('SIGINT'));
 process.once('SIGTERM', () => bot.stop('SIGTERM'));
-
-console.log('VERONICA ONLINE');
