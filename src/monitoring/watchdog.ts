@@ -1,12 +1,14 @@
 import cron from 'node-cron';
 import { Telegraf } from 'telegraf';
 import { getSystemHealth } from '../tools/system';
-import { checkPrometheusHealth, getPrometheusLogs, restartPrometheus } from '../tools/prometheus';
-import { checkGrafanaHealth, getGrafanaLogs, restartGrafana } from '../tools/grafana';
-import { isContainerUnhealthy } from '../tools/docker';
+import { getPrometheusLogs, restartPrometheus } from '../tools/prometheus';
+import { getGrafanaLogs, restartGrafana } from '../tools/grafana';
+import { getContainerStatus, isContainerUnhealthy } from '../tools/docker';
 
-// Per-alert cooldown map — prevents spam for sustained issues.
-// Key = alert type, value = last fire timestamp.
+// Watchdog uses Docker container state as the authoritative health source.
+// HTTP health checks are NOT used here — Veronica may be on a different Docker
+// network than Prometheus/Grafana, making curl failures meaningless as alerts.
+
 const cooldowns: Record<string, number> = {};
 const COOLDOWN_MS = 600_000; // 10 minutes
 
@@ -18,71 +20,33 @@ function setCooldown(key: string): void {
   cooldowns[key] = Date.now();
 }
 
-async function healPrometheus(bot: Telegraf, userId: string): Promise<void> {
-  if (onCooldown('prometheus_heal')) return;
+async function healContainer(
+  bot: Telegraf,
+  userId: string,
+  containerName: string,
+  label: string,
+  restartFn: () => string,
+  logsFn: () => string
+): Promise<void> {
+  const healKey = `${containerName}_heal`;
+  if (onCooldown(healKey)) return;
 
-  const healthy = await checkPrometheusHealth();
-  if (healthy) return;
+  if (!isContainerUnhealthy(containerName)) return; // running = fine
 
-  const stopped = isContainerUnhealthy('prometheus');
+  setCooldown(healKey);
+  const statusBefore = getContainerStatus(containerName);
 
-  if (stopped) {
-    setCooldown('prometheus_heal');
-    restartPrometheus();
-    await new Promise(r => setTimeout(r, 4000));
-    const nowOk = await checkPrometheusHealth();
-    await bot.telegram.sendMessage(
-      userId,
-      nowOk
-        ? `🔧 *Auto-heal:* Prometheus was stopped — restarted successfully. ✅`
-        : `⚠️ *Auto-heal:* Prometheus restarted but still unreachable. Manual check needed.`,
-      { parse_mode: 'Markdown' }
-    );
-  } else if (!onCooldown('prometheus_alert')) {
-    setCooldown('prometheus_alert');
-    const logs = getPrometheusLogs(30).slice(0, 600);
-    await bot.telegram.sendMessage(
-      userId,
-      `⚠️ *Prometheus unreachable* (container running — possible config issue)\n\nRecent logs:\n\`\`\`\n${logs}\n\`\`\``,
-      { parse_mode: 'Markdown' }
-    );
-  }
-}
+  restartFn();
+  await new Promise(r => setTimeout(r, 4000));
 
-async function healGrafana(bot: Telegraf, userId: string): Promise<void> {
-  if (onCooldown('grafana_heal')) return;
-
-  const status = await checkGrafanaHealth();
-
-  // Grafana is private/VPN-only by design — not an incident.
-  if (status === 'healthy') return;
-
-  const stopped = isContainerUnhealthy('grafana');
-
-  // Only auto-restart when internal health check fails AND container is stopped.
-  if (status === 'unreachable' && stopped) {
-    setCooldown('grafana_heal');
-    restartGrafana();
-    await new Promise(r => setTimeout(r, 4000));
-    const afterStatus = await checkGrafanaHealth();
-    await bot.telegram.sendMessage(
-      userId,
-      afterStatus === 'healthy'
-        ? `🔧 *Auto-heal:* Grafana was stopped — restarted successfully. ✅`
-        : `⚠️ *Auto-heal:* Grafana restarted but still unreachable internally. Manual check needed.`,
-      { parse_mode: 'Markdown' }
-    );
-  } else if (status === 'unreachable' && !stopped && !onCooldown('grafana_alert')) {
-    // Container is running but internal health endpoint failed — possible config issue.
-    setCooldown('grafana_alert');
-    const logs = getGrafanaLogs(30).slice(0, 600);
-    await bot.telegram.sendMessage(
-      userId,
-      `⚠️ *Grafana internal health failed* (container running — possible config issue)\n\nRecent logs:\n\`\`\`\n${logs}\n\`\`\``,
-      { parse_mode: 'Markdown' }
-    );
-  }
-  // status === 'private/vpn-only': no alert — this is expected and intentional.
+  const stillBad = isContainerUnhealthy(containerName);
+  await bot.telegram.sendMessage(
+    userId,
+    stillBad
+      ? `⚠️ *Auto-heal:* ${label} was \`${statusBefore}\` — restarted but still unhealthy. Manual check needed.\n\nLogs:\n\`\`\`\n${logsFn().slice(0, 600)}\n\`\`\``
+      : `🔧 *Auto-heal:* ${label} was \`${statusBefore}\` — restarted successfully. ✅`,
+    { parse_mode: 'Markdown' }
+  );
 }
 
 async function resourceAlerts(bot: Telegraf, userId: string): Promise<void> {
@@ -123,8 +87,8 @@ async function resourceAlerts(bot: Telegraf, userId: string): Promise<void> {
 export function startWatchdog(bot: Telegraf, userId: string): void {
   cron.schedule('*/5 * * * *', async () => {
     await resourceAlerts(bot, userId);
-    await healPrometheus(bot, userId);
-    await healGrafana(bot, userId);
+    await healContainer(bot, userId, 'prometheus', 'Prometheus', restartPrometheus, () => getPrometheusLogs(30));
+    await healContainer(bot, userId, 'grafana', 'Grafana', restartGrafana, () => getGrafanaLogs(30));
   });
 
   console.log('VERONICA WATCHDOG ACTIVE — self-heal enabled for Prometheus & Grafana');
