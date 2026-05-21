@@ -1,5 +1,8 @@
 import { execSync } from 'child_process';
 
+// Prometheus is intentionally not exposed publicly.
+// Only internal Docker network checks are valid.
+
 function exec(cmd: string): string {
   try {
     return execSync(cmd, { encoding: 'utf-8', timeout: 10000 }).trim();
@@ -8,22 +11,24 @@ function exec(cmd: string): string {
   }
 }
 
-const HOST = process.env.PROMETHEUS_HOST || 'prometheus';
+function isPrometheusResponse(body: string): boolean {
+  return (
+    body.toLowerCase().includes('prometheus is healthy') ||
+    body.toLowerCase().includes('prometheus is ready')
+  );
+}
 
 export async function checkPrometheusHealth(): Promise<boolean> {
+  const internalHost = process.env.PROMETHEUS_HOST || 'prometheus';
+
+  // Internal Docker network only — public access is disabled by design.
   const urls = [
-    `http://${HOST}:9090/-/healthy`,
+    `http://${internalHost}:9090/-/healthy`,
     'http://127.0.0.1:9090/-/healthy',
   ];
 
   for (const url of urls) {
-    const result = exec(`curl -s --max-time 5 "${url}"`);
-    if (
-      result.toLowerCase().includes('prometheus is healthy') ||
-      result.toLowerCase().includes('prometheus is ready')
-    ) {
-      return true;
-    }
+    if (isPrometheusResponse(exec(`curl -s --max-time 5 "${url}"`))) return true;
   }
   return false;
 }

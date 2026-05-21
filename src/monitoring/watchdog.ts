@@ -52,32 +52,37 @@ async function healPrometheus(bot: Telegraf, userId: string): Promise<void> {
 async function healGrafana(bot: Telegraf, userId: string): Promise<void> {
   if (onCooldown('grafana_heal')) return;
 
-  const healthy = await checkGrafanaHealth();
-  if (healthy) return;
+  const status = await checkGrafanaHealth();
+
+  // Grafana is private/VPN-only by design — not an incident.
+  if (status === 'healthy') return;
 
   const stopped = isContainerUnhealthy('grafana');
 
-  if (stopped) {
+  // Only auto-restart when internal health check fails AND container is stopped.
+  if (status === 'unreachable' && stopped) {
     setCooldown('grafana_heal');
     restartGrafana();
     await new Promise(r => setTimeout(r, 4000));
-    const nowOk = await checkGrafanaHealth();
+    const afterStatus = await checkGrafanaHealth();
     await bot.telegram.sendMessage(
       userId,
-      nowOk
+      afterStatus === 'healthy'
         ? `🔧 *Auto-heal:* Grafana was stopped — restarted successfully. ✅`
-        : `⚠️ *Auto-heal:* Grafana restarted but still unreachable. Manual check needed.`,
+        : `⚠️ *Auto-heal:* Grafana restarted but still unreachable internally. Manual check needed.`,
       { parse_mode: 'Markdown' }
     );
-  } else if (!onCooldown('grafana_alert')) {
+  } else if (status === 'unreachable' && !stopped && !onCooldown('grafana_alert')) {
+    // Container is running but internal health endpoint failed — possible config issue.
     setCooldown('grafana_alert');
     const logs = getGrafanaLogs(30).slice(0, 600);
     await bot.telegram.sendMessage(
       userId,
-      `⚠️ *Grafana unreachable* (container running — possible config issue)\n\nRecent logs:\n\`\`\`\n${logs}\n\`\`\``,
+      `⚠️ *Grafana internal health failed* (container running — possible config issue)\n\nRecent logs:\n\`\`\`\n${logs}\n\`\`\``,
       { parse_mode: 'Markdown' }
     );
   }
+  // status === 'private/vpn-only': no alert — this is expected and intentional.
 }
 
 async function resourceAlerts(bot: Telegraf, userId: string): Promise<void> {

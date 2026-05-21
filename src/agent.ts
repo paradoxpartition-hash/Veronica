@@ -109,13 +109,13 @@ async function gatherContext(intent: Intent): Promise<GatheredContext> {
   const service = intent.service;
 
   if (intent.type === 'CHECK_HEALTH') {
-    const [pOk, gOk, nOk] = await Promise.all([
+    const [pOk, grafanaStatus, nOk] = await Promise.all([
       checkPrometheusHealth(),
       checkGrafanaHealth(),
       checkNginxHealth(),
     ]);
     serviceData['prometheus_healthy'] = String(pOk);
-    serviceData['grafana_healthy'] = String(gOk);
+    serviceData['grafana_status'] = grafanaStatus; // 'healthy' | 'unreachable' | 'private/vpn-only'
     serviceData['nginx_healthy'] = String(nOk);
     serviceData['mailcow_status'] = checkMailcowHealth();
   }
@@ -130,10 +130,11 @@ async function gatherContext(intent: Intent): Promise<GatheredContext> {
   }
 
   if (service === 'grafana') {
-    const healthy = await checkGrafanaHealth();
-    serviceData['grafana_healthy'] = String(healthy);
+    const grafanaStatus = await checkGrafanaHealth();
+    serviceData['grafana_status'] = grafanaStatus;
     serviceData['grafana_container'] = getContainerStatus('grafana');
-    if (!healthy || intent.type === 'CHECK_LOGS') {
+    // Only pull logs if internal health check failed (not merely private access)
+    if (grafanaStatus === 'unreachable' || intent.type === 'CHECK_LOGS') {
       serviceData['grafana_logs'] = getGrafanaLogs(80);
     }
   }
@@ -221,17 +222,19 @@ async function planAndExecute(
     }
 
     if (service === 'grafana') {
-      const healthy = context.serviceData['grafana_healthy'] === 'true';
+      const grafanaStatus = context.serviceData['grafana_status'];
       const stopped = isContainerUnhealthy('grafana');
 
-      if (!healthy && stopped && intent.type === 'FIX_SERVICE') {
+      // Only act if internal health check failed AND container is actually stopped.
+      // 'private/vpn-only' is not an incident — public access is disabled by design.
+      if (grafanaStatus === 'unreachable' && stopped && intent.type === 'FIX_SERVICE') {
         const level = classifyAction('restart_grafana');
         if (level === 'SAFE_AUTO') {
           const output = restartGrafana();
           results.push({ action: 'restart_grafana', status: 'executed', output });
           await new Promise(r => setTimeout(r, 3500));
-          const nowOk = await checkGrafanaHealth();
-          context.serviceData['grafana_healthy_after'] = String(nowOk);
+          const afterStatus = await checkGrafanaHealth();
+          context.serviceData['grafana_status_after'] = afterStatus;
         }
       }
     }
