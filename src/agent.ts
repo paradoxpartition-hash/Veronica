@@ -2,6 +2,8 @@ import { ChatOllama } from '@langchain/ollama';
 import { setLastTopic, getLastTopic } from './memory';
 import { requestApproval } from './approvals';
 import { classifyAction, isMonitoringContainer } from './safety';
+import { buildIdentityContext, buildSelfAwarenessReport } from './identity';
+import { logIncident, getIncidentsForService, getRecentIncidents, formatIncidents } from './incidents';
 import {
   getDockerHealthSummary,
   getContainerStatus,
@@ -24,6 +26,7 @@ type IntentType =
   | 'CHECK_LOGS'
   | 'RESTART_CONTAINER'
   | 'CHECK_DISK'
+  | 'SELF_AWARENESS'
   | 'GENERAL';
 
 interface Intent {
@@ -61,11 +64,15 @@ function resolveService(message: string): string | undefined {
 function detectIntent(message: string, lastTopic: string): Intent {
   const m = message.toLowerCase().trim();
 
+  // Follow-up
   const isFollowUp = FOLLOW_UP_PHRASES.some(
     p => m === p || m.startsWith(p + ' ') || m.endsWith(' ' + p)
   );
-  if (isFollowUp && lastTopic) {
-    return detectIntent(lastTopic, '');
+  if (isFollowUp && lastTopic) return detectIntent(lastTopic, '');
+
+  // Self-awareness
+  if (/what are you|what can you do|your capabilities|what do you know|what are you responsible|list your|your limits|what services|who are you/.test(m)) {
+    return { type: 'SELF_AWARENESS' };
   }
 
   const service = resolveService(m);
@@ -91,12 +98,13 @@ function detectIntent(message: string, lastTopic: string): Intent {
   return { type: 'GENERAL' };
 }
 
-// ─── Context ──────────────────────────────────────────────────────────────────
+// ─── Context ─────────────────────────────────────────────────────────────────
 
 interface GatheredContext {
   systemHealth: Awaited<ReturnType<typeof getSystemHealth>>;
   dockerSummary: string;
   serviceData: Record<string, string>;
+  pastIncidents: string;
 }
 
 async function gatherContext(intent: Intent): Promise<GatheredContext> {
@@ -108,6 +116,13 @@ async function gatherContext(intent: Intent): Promise<GatheredContext> {
   const serviceData: Record<string, string> = {};
   const service = intent.service;
 
+  // Past incidents — include when diagnosing or fixing a service
+  let pastIncidents = '';
+  if (service && ['DIAGNOSE_SERVICE', 'FIX_SERVICE', 'CHECK_LOGS'].includes(intent.type)) {
+    const incidents = await getIncidentsForService(service, 3);
+    pastIncidents = formatIncidents(incidents);
+  }
+
   if (intent.type === 'CHECK_HEALTH') {
     const [pOk, grafanaStatus, nOk] = await Promise.all([
       checkPrometheusHealth(),
@@ -115,9 +130,11 @@ async function gatherContext(intent: Intent): Promise<GatheredContext> {
       checkNginxHealth(),
     ]);
     serviceData['prometheus_healthy'] = String(pOk);
-    serviceData['grafana_status'] = grafanaStatus; // 'healthy' | 'unreachable' | 'private/vpn-only'
+    serviceData['grafana_status'] = grafanaStatus;
     serviceData['nginx_healthy'] = String(nOk);
     serviceData['mailcow_status'] = checkMailcowHealth();
+    const recent = await getRecentIncidents(5);
+    pastIncidents = formatIncidents(recent);
   }
 
   if (service === 'prometheus') {
@@ -133,7 +150,6 @@ async function gatherContext(intent: Intent): Promise<GatheredContext> {
     const grafanaStatus = await checkGrafanaHealth();
     serviceData['grafana_status'] = grafanaStatus;
     serviceData['grafana_container'] = getContainerStatus('grafana');
-    // Only pull logs if internal health check failed (not merely private access)
     if (grafanaStatus === 'unreachable' || intent.type === 'CHECK_LOGS') {
       serviceData['grafana_logs'] = getGrafanaLogs(80);
     }
@@ -173,7 +189,7 @@ async function gatherContext(intent: Intent): Promise<GatheredContext> {
     serviceData['disk_detail'] = getDiskUsage();
   }
 
-  return { systemHealth, dockerSummary, serviceData };
+  return { systemHealth, dockerSummary, serviceData, pastIncidents };
 }
 
 // ─── Actions ─────────────────────────────────────────────────────────────────
@@ -202,7 +218,6 @@ async function planAndExecute(
   const results: ActionResult[] = [];
   const service = intent.service;
 
-  // ── Auto-restart monitoring containers when they are stopped ──────────────
   if ((intent.type === 'FIX_SERVICE' || intent.type === 'DIAGNOSE_SERVICE') && service) {
 
     if (service === 'prometheus') {
@@ -217,6 +232,13 @@ async function planAndExecute(
           await new Promise(r => setTimeout(r, 3500));
           const nowOk = await checkPrometheusHealth();
           context.serviceData['prometheus_healthy_after'] = String(nowOk);
+          await logIncident({
+            service: 'prometheus',
+            symptom: 'Container stopped/unhealthy',
+            evidence: `Container status before restart: stopped`,
+            actionTaken: 'Auto-restarted (SAFE_AUTO)',
+            result: nowOk ? 'Recovered — healthy' : 'Still unreachable after restart',
+          });
         }
       }
     }
@@ -225,8 +247,6 @@ async function planAndExecute(
       const grafanaStatus = context.serviceData['grafana_status'];
       const stopped = isContainerUnhealthy('grafana');
 
-      // Only act if internal health check failed AND container is actually stopped.
-      // 'private/vpn-only' is not an incident — public access is disabled by design.
       if (grafanaStatus === 'unreachable' && stopped && intent.type === 'FIX_SERVICE') {
         const level = classifyAction('restart_grafana');
         if (level === 'SAFE_AUTO') {
@@ -235,6 +255,13 @@ async function planAndExecute(
           await new Promise(r => setTimeout(r, 3500));
           const afterStatus = await checkGrafanaHealth();
           context.serviceData['grafana_status_after'] = afterStatus;
+          await logIncident({
+            service: 'grafana',
+            symptom: 'Container stopped/unhealthy',
+            evidence: 'Container status: stopped, internal health check failed',
+            actionTaken: 'Auto-restarted (SAFE_AUTO)',
+            result: afterStatus === 'healthy' ? 'Recovered — healthy' : `Still ${afterStatus} after restart`,
+          });
         }
       }
     }
@@ -245,22 +272,40 @@ async function planAndExecute(
           bot, userId,
           'restart_mailcow',
           'Mailcow appears unhealthy. Restart core mail services?',
-          async () => restartContainer('mailcowdockerized-postfix-mailcow-1')
+          async () => {
+            const out = restartContainer('mailcowdockerized-postfix-mailcow-1');
+            await logIncident({
+              service: 'mailcow',
+              symptom: 'Unhealthy containers detected',
+              evidence: 'isMailcowHealthy() returned false',
+              actionTaken: 'Restarted postfix container (approved by Othman)',
+              result: out,
+            });
+            return out;
+          }
         );
         results.push({ action: 'restart_mailcow', status: 'queued_for_approval' });
       }
     }
 
     if (service === 'nginx' && intent.type === 'FIX_SERVICE') {
-      const healthy = context.serviceData['nginx_healthy'] === 'true';
       const stopped = isContainerUnhealthy('nginx-proxy-manager');
-
-      if (!healthy && stopped) {
+      if (stopped) {
         await requestApproval(
           bot, userId,
           'restart_nginx_proxy_manager',
-          'Nginx Proxy Manager is down. Restart it?',
-          async () => restartNginx()
+          'Nginx Proxy Manager container is stopped. Restart it?',
+          async () => {
+            const out = restartNginx();
+            await logIncident({
+              service: 'nginx',
+              symptom: 'Container stopped',
+              evidence: 'isContainerUnhealthy returned true',
+              actionTaken: 'Restarted nginx-proxy-manager (approved by Othman)',
+              result: out,
+            });
+            return out;
+          }
         );
         results.push({ action: 'restart_nginx_proxy_manager', status: 'queued_for_approval' });
       }
@@ -272,13 +317,22 @@ async function planAndExecute(
         bot, userId,
         `restart_${service}`,
         `Restart ${service} (${containerName})?`,
-        async () => restartContainer(containerName)
+        async () => {
+          const out = restartContainer(containerName);
+          await logIncident({
+            service,
+            symptom: 'Manual fix requested',
+            evidence: 'User requested fix via Telegram',
+            actionTaken: `Restarted ${containerName} (approved by Othman)`,
+            result: out,
+          });
+          return out;
+        }
       );
       results.push({ action: `restart_${service}`, status: 'queued_for_approval' });
     }
   }
 
-  // ── Explicit restart request ───────────────────────────────────────────────
   if (intent.type === 'RESTART_CONTAINER' && service) {
     const containerName = CONTAINER_MAP[service] || service;
     const actionKey = isMonitoringContainer(containerName)
@@ -293,7 +347,7 @@ async function planAndExecute(
       await requestApproval(
         bot, userId,
         `restart_${service}`,
-        `Restart ${service} container (${containerName})?`,
+        `Restart ${service} (${containerName})?`,
         async () => restartContainer(containerName)
       );
       results.push({ action: `restart_${service}`, status: 'queued_for_approval' });
@@ -319,7 +373,7 @@ async function generateResponse(
   context: GatheredContext,
   actions: ActionResult[]
 ): Promise<string> {
-  const { systemHealth, dockerSummary, serviceData } = context;
+  const { systemHealth, dockerSummary, serviceData, pastIncidents } = context;
 
   const actionsText = actions.length > 0
     ? actions.map(r => {
@@ -334,39 +388,42 @@ async function generateResponse(
     .map(([k, v]) => `${k}: ${v}`)
     .join('\n');
 
-  const prompt = `You are Veronica, Othman's AI infrastructure operator running on his VPS.
+  const prompt = `${buildIdentityContext()}
 
+---
 User said: "${originalMessage}"
 
 LIVE SYSTEM:
-CPU: ${systemHealth.cpu.toFixed(1)}%
-RAM: ${systemHealth.ramUsedGb.toFixed(2)} / ${systemHealth.ramTotalGb.toFixed(2)} GB (${systemHealth.ramPercent.toFixed(1)}%)
-Disk: ${systemHealth.diskUsedPercent.toFixed(1)}%
-Uptime: ${systemHealth.uptimeHours}h
+CPU: ${systemHealth.cpu.toFixed(1)}% | RAM: ${systemHealth.ramPercent.toFixed(1)}% (${systemHealth.ramUsedGb.toFixed(1)}/${systemHealth.ramTotalGb.toFixed(1)} GB) | Disk: ${systemHealth.diskUsedPercent.toFixed(1)}% | Uptime: ${systemHealth.uptimeHours}h
 
 DOCKER STATUS:
 ${dockerSummary}
 
 SERVICE DATA:
-${serviceContext || 'No service-specific data collected.'}
+${serviceContext || 'None collected.'}
+
+PAST INCIDENTS (relevant):
+${pastIncidents || 'None on record.'}
 
 ACTIONS I TOOK:
 ${actionsText}
 
 RULES:
-- Never output JSON, code blocks, or ask the user to run commands.
+- Never output JSON, code blocks, or tell the user to run commands.
 - Never invent data not shown above.
 - "Up X hours" without (unhealthy)/Exited/Dead/Restarting = HEALTHY.
 - CPU <70%, RAM <80%, Disk <80% are normal.
-- If approval is pending, tell the user to check the approval message above.
-- Be concise, operational, direct. Max 350 words.
+- Grafana VPN-only = by design, not a failure.
+- If approval is pending, tell Othman to check the approval message.
+- Always explain what you did and why.
+- Be concise and direct. Max 350 words.
 
 FORMAT:
 Health verdict: [Healthy / Warning / Critical / Unknown]
 Findings: what you observed
-Actions taken: what was done automatically (or "None")
-Pending approval: action name if queued, or "None"
-Next step: one concrete recommendation if needed`;
+Actions taken: what was done and why
+Pending approval: action name, or "None"
+Next step: one concrete recommendation, or "None needed"`;
 
   try {
     const response = await model.invoke([{ role: 'user', content: prompt }]);
@@ -375,11 +432,11 @@ Next step: one concrete recommendation if needed`;
       : JSON.stringify(response.content);
     return text.slice(0, 3500);
   } catch (err: any) {
-    // Fallback: raw findings without LLM
     return [
       `Actions: ${actionsText}`,
       serviceContext ? `Context:\n${serviceContext}` : '',
       `System: CPU ${systemHealth.cpu.toFixed(1)}% | RAM ${systemHealth.ramPercent.toFixed(1)}% | Disk ${systemHealth.diskUsedPercent.toFixed(1)}%`,
+      pastIncidents ? `Past incidents:\n${pastIncidents}` : '',
     ].filter(Boolean).join('\n\n');
   }
 }
@@ -393,6 +450,14 @@ export async function processMessage(
 ): Promise<string> {
   const lastTopic = await getLastTopic(userId);
   const intent = detectIntent(message, lastTopic);
+
+  // Self-awareness: answer directly, no LLM needed
+  if (intent.type === 'SELF_AWARENESS') {
+    await setLastTopic(userId, message);
+    const recent = await getRecentIncidents(5);
+    return buildSelfAwarenessReport(formatIncidents(recent));
+  }
+
   const context = await gatherContext(intent);
   const actions = await planAndExecute(intent, context, userId, bot);
   await setLastTopic(userId, message);
