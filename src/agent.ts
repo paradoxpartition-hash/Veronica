@@ -1,132 +1,397 @@
-import { ChatOllama } from "@langchain/ollama";
-
+import { ChatOllama } from '@langchain/ollama';
+import { setLastTopic, getLastTopic } from './memory';
+import { requestApproval } from './approvals';
+import { classifyAction, isMonitoringContainer } from './safety';
 import {
-    getDockerContainers,
-    getDockerHealthSummary,
-    getContainerLogs
-} from "./tools/docker";
+  getDockerHealthSummary,
+  getContainerStatus,
+  getContainerLogs,
+  restartContainer,
+  isContainerUnhealthy,
+} from './tools/docker';
+import { getSystemHealth, getDiskUsage } from './tools/system';
+import { checkPrometheusHealth, getPrometheusLogs, restartPrometheus } from './tools/prometheus';
+import { checkGrafanaHealth, getGrafanaLogs, restartGrafana } from './tools/grafana';
+import { checkMailcowHealth, getMailcowWatchdogLogs, isMailcowHealthy } from './tools/mailcow';
+import { checkNginxHealth, getNginxLogs, restartNginx } from './tools/nginx';
 
-import { getSystemHealth } from "./tools/system";
-import { setMemory, getMemory } from "./memory";
+// ─── Intent ──────────────────────────────────────────────────────────────────
 
-const model = new ChatOllama({
-    baseUrl: process.env.OLLAMA_HOST,
-    model: process.env.OLLAMA_MODEL,
-    temperature: 0.1
-});
+type IntentType =
+  | 'DIAGNOSE_SERVICE'
+  | 'FIX_SERVICE'
+  | 'CHECK_HEALTH'
+  | 'CHECK_LOGS'
+  | 'RESTART_CONTAINER'
+  | 'CHECK_DISK'
+  | 'GENERAL';
 
-export async function askVeronica(message: string) {
+interface Intent {
+  type: IntentType;
+  service?: string;
+}
 
-    const lastTopic = await getMemory("last_topic");
+const FOLLOW_UP_PHRASES = [
+  "what?", "why?", "fix it", "do it", "check it", "what exactly",
+  "go deeper", "tell me more", "try it", "and?", "then?", "now what", "so?",
+];
 
-    const systemHealth = await getSystemHealth();
-    const dockerHealth = getDockerHealthSummary();
-    const dockerContainers = getDockerContainers();
+const SERVICE_ALIASES: Record<string, string> = {
+  prometheus: 'prometheus',
+  grafana: 'grafana',
+  mailcow: 'mailcow',
+  mail: 'mailcow',
+  nginx: 'nginx',
+  npm: 'nginx',
+  'proxy manager': 'nginx',
+  'nginx proxy manager': 'nginx',
+  portainer: 'portainer',
+  saasolution: 'saasolution',
+  saas: 'saasolution',
+};
 
-    let extraLogs = "";
+function resolveService(message: string): string | undefined {
+  const m = message.toLowerCase();
+  for (const [alias, service] of Object.entries(SERVICE_ALIASES)) {
+    if (m.includes(alias)) return service;
+  }
+  return undefined;
+}
 
-    const lowerMessage = message.toLowerCase();
-    const lastTopicText = String(lastTopic || "").toLowerCase();
+function detectIntent(message: string, lastTopic: string): Intent {
+  const m = message.toLowerCase().trim();
 
-    if (
-        lowerMessage.includes("watchdog") ||
-        lowerMessage.includes("mailcow") ||
-        lowerMessage.includes("logs") ||
-        lowerMessage.includes("check it") ||
-        lowerMessage.includes("go deeper") ||
-        lowerMessage.includes("what exactly") ||
-        lastTopicText.includes("mailcow") ||
-        lastTopicText.includes("watchdog")
-    ) {
-        extraLogs = getContainerLogs("mailcowdockerized-watchdog-mailcow-1", 120);
+  const isFollowUp = FOLLOW_UP_PHRASES.some(
+    p => m === p || m.startsWith(p + ' ') || m.endsWith(' ' + p)
+  );
+  if (isFollowUp && lastTopic) {
+    return detectIntent(lastTopic, '');
+  }
+
+  const service = resolveService(m);
+
+  if (/disk|space|storage|full/.test(m)) return { type: 'CHECK_DISK' };
+
+  if (/health|status|overview|how are you|everything ok|all good|how is everything/.test(m) && !service) {
+    return { type: 'CHECK_HEALTH' };
+  }
+
+  if (/logs?|output/.test(m) && service) return { type: 'CHECK_LOGS', service };
+
+  if (/restart|reboot/.test(m) && service) return { type: 'RESTART_CONTAINER', service };
+
+  if (/fix|repair|heal|resolve|recover/.test(m) && service) return { type: 'FIX_SERVICE', service };
+
+  if (service && /check|diagnose|what|why|unreachable|down|not working|broken|issue|problem|fail/.test(m)) {
+    return { type: 'DIAGNOSE_SERVICE', service };
+  }
+
+  if (service) return { type: 'DIAGNOSE_SERVICE', service };
+
+  return { type: 'GENERAL' };
+}
+
+// ─── Context ──────────────────────────────────────────────────────────────────
+
+interface GatheredContext {
+  systemHealth: Awaited<ReturnType<typeof getSystemHealth>>;
+  dockerSummary: string;
+  serviceData: Record<string, string>;
+}
+
+async function gatherContext(intent: Intent): Promise<GatheredContext> {
+  const [systemHealth, dockerSummary] = await Promise.all([
+    getSystemHealth(),
+    Promise.resolve(getDockerHealthSummary()),
+  ]);
+
+  const serviceData: Record<string, string> = {};
+  const service = intent.service;
+
+  if (intent.type === 'CHECK_HEALTH') {
+    const [pOk, gOk, nOk] = await Promise.all([
+      checkPrometheusHealth(),
+      checkGrafanaHealth(),
+      checkNginxHealth(),
+    ]);
+    serviceData['prometheus_healthy'] = String(pOk);
+    serviceData['grafana_healthy'] = String(gOk);
+    serviceData['nginx_healthy'] = String(nOk);
+    serviceData['mailcow_status'] = checkMailcowHealth();
+  }
+
+  if (service === 'prometheus') {
+    const healthy = await checkPrometheusHealth();
+    serviceData['prometheus_healthy'] = String(healthy);
+    serviceData['prometheus_container'] = getContainerStatus('prometheus');
+    if (!healthy || intent.type === 'CHECK_LOGS') {
+      serviceData['prometheus_logs'] = getPrometheusLogs(100);
+    }
+  }
+
+  if (service === 'grafana') {
+    const healthy = await checkGrafanaHealth();
+    serviceData['grafana_healthy'] = String(healthy);
+    serviceData['grafana_container'] = getContainerStatus('grafana');
+    if (!healthy || intent.type === 'CHECK_LOGS') {
+      serviceData['grafana_logs'] = getGrafanaLogs(80);
+    }
+  }
+
+  if (service === 'mailcow') {
+    serviceData['mailcow_status'] = checkMailcowHealth();
+    if (['CHECK_LOGS', 'DIAGNOSE_SERVICE', 'FIX_SERVICE'].includes(intent.type)) {
+      serviceData['mailcow_watchdog_logs'] = getMailcowWatchdogLogs(120);
+    }
+  }
+
+  if (service === 'nginx') {
+    const healthy = await checkNginxHealth();
+    serviceData['nginx_healthy'] = String(healthy);
+    serviceData['nginx_container'] = getContainerStatus('nginx-proxy-manager');
+    if (!healthy || intent.type === 'CHECK_LOGS') {
+      serviceData['nginx_logs'] = getNginxLogs(80);
+    }
+  }
+
+  if (service === 'portainer') {
+    serviceData['portainer_container'] = getContainerStatus('portainer');
+    if (intent.type === 'CHECK_LOGS') {
+      serviceData['portainer_logs'] = getContainerLogs('portainer', 60);
+    }
+  }
+
+  if (service === 'saasolution') {
+    serviceData['saasolution_container'] = getContainerStatus('saasolution');
+    if (intent.type === 'CHECK_LOGS') {
+      serviceData['saasolution_logs'] = getContainerLogs('saasolution', 80);
+    }
+  }
+
+  if (intent.type === 'CHECK_DISK') {
+    serviceData['disk_detail'] = getDiskUsage();
+  }
+
+  return { systemHealth, dockerSummary, serviceData };
+}
+
+// ─── Actions ─────────────────────────────────────────────────────────────────
+
+interface ActionResult {
+  action: string;
+  status: 'executed' | 'queued_for_approval' | 'blocked' | 'skipped';
+  output?: string;
+}
+
+const CONTAINER_MAP: Record<string, string> = {
+  prometheus: 'prometheus',
+  grafana: 'grafana',
+  nginx: 'nginx-proxy-manager',
+  mailcow: 'mailcowdockerized-watchdog-mailcow-1',
+  portainer: 'portainer',
+  saasolution: 'saasolution',
+};
+
+async function planAndExecute(
+  intent: Intent,
+  context: GatheredContext,
+  userId: string,
+  bot: any
+): Promise<ActionResult[]> {
+  const results: ActionResult[] = [];
+  const service = intent.service;
+
+  // ── Auto-restart monitoring containers when they are stopped ──────────────
+  if ((intent.type === 'FIX_SERVICE' || intent.type === 'DIAGNOSE_SERVICE') && service) {
+
+    if (service === 'prometheus') {
+      const healthy = context.serviceData['prometheus_healthy'] === 'true';
+      const stopped = isContainerUnhealthy('prometheus');
+
+      if (!healthy && stopped && intent.type === 'FIX_SERVICE') {
+        const level = classifyAction('restart_prometheus');
+        if (level === 'SAFE_AUTO') {
+          const output = restartPrometheus();
+          results.push({ action: 'restart_prometheus', status: 'executed', output });
+          await new Promise(r => setTimeout(r, 3500));
+          const nowOk = await checkPrometheusHealth();
+          context.serviceData['prometheus_healthy_after'] = String(nowOk);
+        }
+      }
     }
 
-    const prompt = `
-You are Veronica, Othman's AI infrastructure operator.
+    if (service === 'grafana') {
+      const healthy = context.serviceData['grafana_healthy'] === 'true';
+      const stopped = isContainerUnhealthy('grafana');
 
-The user asked:
-${message}
-
-Previous topic:
-${lastTopic || "None"}
-
-LIVE SYSTEM HEALTH:
-CPU: ${systemHealth.cpu.toFixed(1)}%
-RAM: ${systemHealth.ramUsedGb.toFixed(2)} / ${systemHealth.ramTotalGb.toFixed(2)} GB
-Disk: ${systemHealth.diskUsedPercent.toFixed(1)}%
-Uptime: ${systemHealth.uptimeHours} hours
-
-DOCKER HEALTH SUMMARY:
-${dockerHealth}
-
-RUNNING CONTAINERS:
-${dockerContainers}
-
-RELEVANT CONTAINER LOGS:
-${extraLogs || "No extra logs collected."}
-
-Critical interpretation rules:
-- If Docker status says only "Up X hours" and does NOT contain "(unhealthy)", "Exited", "Restarting", or "Dead", then the container is healthy/running.
-- Do NOT mark a service Warning or Critical just because it has long uptime.
-- Long uptime usually means stability.
-- If Docker status text contains "(unhealthy)", then mark the verdict as Warning or Critical depending on the affected service.
-- If logs are provided, analyze the actual log content.
-- Do NOT claim the logs show something unless it appears in RELEVANT CONTAINER LOGS.
-
-General rules:
-- Do NOT output JSON.
-- Do NOT mention tool calls.
-- Do NOT ask the user to run commands.
-- Use only the live context above.
-- Never invent per-container CPU/RAM.
-- Docker "Up X hours" means running, not unhealthy.
-- Only call a container unhealthy if the Docker status text literally contains:
-  "(unhealthy)"
-  "Exited"
-  "Restarting"
-  "Dead"
-- Lowercase words like "unhealthy" inside these instructions do NOT count as evidence.
-- Evidence must come from the LIVE Docker status/context above.
-- CPU below 70% is normal.
-- RAM below 80% is normal.
-- Disk below 80% is normal.
-- Dangerous actions require approval.
-- Health verdict MUST be exactly one of:
-  Healthy
-  Warning
-  Critical
-  Unknown
-- Never use "None detected" as the health verdict.
-- If all containers are healthy/running, the Health verdict MUST be "Healthy".
-- A healthy container can NEVER produce a "Critical" verdict.
-- If Explicit unhealthy container/service says "None detected", the verdict cannot be Critical.
-- If a container is unhealthy, Safe next action should usually be checking its logs.
-- Never answer "None detected" for Safe next action.
-- If the user asks short follow-up questions like:
-  "what?"
-  "why?"
-  "fix it"
-  "do it"
-  "check it"
-  "what exactly?"
-  then assume they refer to the Previous topic.
-
-Answer format:
-1. Health verdict
-2. Explicit unhealthy container/service: only name a service if Docker status literally contains "(unhealthy)", "Exited", "Restarting", or "Dead"; otherwise say "None detected"
-3. Evidence from live context
-4. Safe next action: always give one concrete read-only check
-5. Action requiring approval: always say what action needs approval, or say "None required"
-`;
-
-    const response = await model.invoke([
-        {
-            role: "user",
-            content: prompt
+      if (!healthy && stopped && intent.type === 'FIX_SERVICE') {
+        const level = classifyAction('restart_grafana');
+        if (level === 'SAFE_AUTO') {
+          const output = restartGrafana();
+          results.push({ action: 'restart_grafana', status: 'executed', output });
+          await new Promise(r => setTimeout(r, 3500));
+          const nowOk = await checkGrafanaHealth();
+          context.serviceData['grafana_healthy_after'] = String(nowOk);
         }
-    ]);
+      }
+    }
 
-    await setMemory("last_topic", message);
+    if (service === 'mailcow' && intent.type === 'FIX_SERVICE') {
+      if (!isMailcowHealthy()) {
+        await requestApproval(
+          bot, userId,
+          'restart_mailcow',
+          'Mailcow appears unhealthy. Restart core mail services?',
+          async () => restartContainer('mailcowdockerized-postfix-mailcow-1')
+        );
+        results.push({ action: 'restart_mailcow', status: 'queued_for_approval' });
+      }
+    }
 
-    return response;
+    if (service === 'nginx' && intent.type === 'FIX_SERVICE') {
+      const healthy = context.serviceData['nginx_healthy'] === 'true';
+      const stopped = isContainerUnhealthy('nginx-proxy-manager');
+
+      if (!healthy && stopped) {
+        await requestApproval(
+          bot, userId,
+          'restart_nginx_proxy_manager',
+          'Nginx Proxy Manager is down. Restart it?',
+          async () => restartNginx()
+        );
+        results.push({ action: 'restart_nginx_proxy_manager', status: 'queued_for_approval' });
+      }
+    }
+
+    if ((service === 'portainer' || service === 'saasolution') && intent.type === 'FIX_SERVICE') {
+      const containerName = CONTAINER_MAP[service];
+      await requestApproval(
+        bot, userId,
+        `restart_${service}`,
+        `Restart ${service} (${containerName})?`,
+        async () => restartContainer(containerName)
+      );
+      results.push({ action: `restart_${service}`, status: 'queued_for_approval' });
+    }
+  }
+
+  // ── Explicit restart request ───────────────────────────────────────────────
+  if (intent.type === 'RESTART_CONTAINER' && service) {
+    const containerName = CONTAINER_MAP[service] || service;
+    const actionKey = isMonitoringContainer(containerName)
+      ? `restart_${service}`
+      : 'restart_container';
+    const level = classifyAction(actionKey);
+
+    if (level === 'SAFE_AUTO') {
+      const output = restartContainer(containerName);
+      results.push({ action: `restart_${service}`, status: 'executed', output });
+    } else if (level === 'REQUIRES_APPROVAL') {
+      await requestApproval(
+        bot, userId,
+        `restart_${service}`,
+        `Restart ${service} container (${containerName})?`,
+        async () => restartContainer(containerName)
+      );
+      results.push({ action: `restart_${service}`, status: 'queued_for_approval' });
+    } else {
+      results.push({ action: `restart_${service}`, status: 'blocked' });
+    }
+  }
+
+  return results;
+}
+
+// ─── Response generation ──────────────────────────────────────────────────────
+
+const model = new ChatOllama({
+  baseUrl: process.env.OLLAMA_HOST || 'http://ollama:11434',
+  model: process.env.OLLAMA_MODEL || 'llama3',
+  temperature: 0.1,
+});
+
+async function generateResponse(
+  intent: Intent,
+  originalMessage: string,
+  context: GatheredContext,
+  actions: ActionResult[]
+): Promise<string> {
+  const { systemHealth, dockerSummary, serviceData } = context;
+
+  const actionsText = actions.length > 0
+    ? actions.map(r => {
+        if (r.status === 'executed') return `EXECUTED: ${r.action} → ${r.output || 'done'}`;
+        if (r.status === 'queued_for_approval') return `PENDING APPROVAL: ${r.action}`;
+        if (r.status === 'blocked') return `BLOCKED (FORBIDDEN): ${r.action}`;
+        return `SKIPPED: ${r.action}`;
+      }).join('\n')
+    : 'No actions taken.';
+
+  const serviceContext = Object.entries(serviceData)
+    .map(([k, v]) => `${k}: ${v}`)
+    .join('\n');
+
+  const prompt = `You are Veronica, Othman's AI infrastructure operator running on his VPS.
+
+User said: "${originalMessage}"
+
+LIVE SYSTEM:
+CPU: ${systemHealth.cpu.toFixed(1)}%
+RAM: ${systemHealth.ramUsedGb.toFixed(2)} / ${systemHealth.ramTotalGb.toFixed(2)} GB (${systemHealth.ramPercent.toFixed(1)}%)
+Disk: ${systemHealth.diskUsedPercent.toFixed(1)}%
+Uptime: ${systemHealth.uptimeHours}h
+
+DOCKER STATUS:
+${dockerSummary}
+
+SERVICE DATA:
+${serviceContext || 'No service-specific data collected.'}
+
+ACTIONS I TOOK:
+${actionsText}
+
+RULES:
+- Never output JSON, code blocks, or ask the user to run commands.
+- Never invent data not shown above.
+- "Up X hours" without (unhealthy)/Exited/Dead/Restarting = HEALTHY.
+- CPU <70%, RAM <80%, Disk <80% are normal.
+- If approval is pending, tell the user to check the approval message above.
+- Be concise, operational, direct. Max 350 words.
+
+FORMAT:
+Health verdict: [Healthy / Warning / Critical / Unknown]
+Findings: what you observed
+Actions taken: what was done automatically (or "None")
+Pending approval: action name if queued, or "None"
+Next step: one concrete recommendation if needed`;
+
+  try {
+    const response = await model.invoke([{ role: 'user', content: prompt }]);
+    const text = typeof response.content === 'string'
+      ? response.content
+      : JSON.stringify(response.content);
+    return text.slice(0, 3500);
+  } catch (err: any) {
+    // Fallback: raw findings without LLM
+    return [
+      `Actions: ${actionsText}`,
+      serviceContext ? `Context:\n${serviceContext}` : '',
+      `System: CPU ${systemHealth.cpu.toFixed(1)}% | RAM ${systemHealth.ramPercent.toFixed(1)}% | Disk ${systemHealth.diskUsedPercent.toFixed(1)}%`,
+    ].filter(Boolean).join('\n\n');
+  }
+}
+
+// ─── Public entry point ───────────────────────────────────────────────────────
+
+export async function processMessage(
+  message: string,
+  userId: string,
+  bot: any
+): Promise<string> {
+  const lastTopic = await getLastTopic(userId);
+  const intent = detectIntent(message, lastTopic);
+  const context = await gatherContext(intent);
+  const actions = await planAndExecute(intent, context, userId, bot);
+  await setLastTopic(userId, message);
+  return generateResponse(intent, message, context, actions);
 }

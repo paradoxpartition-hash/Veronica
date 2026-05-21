@@ -1,19 +1,37 @@
-import Redis from "ioredis";
+import Redis from 'ioredis';
 
-const redis = new Redis({
-    host: process.env.REDIS_HOST || "redis"
+export const redis = new Redis({
+  host: process.env.REDIS_HOST || 'redis',
+  port: Number(process.env.REDIS_PORT) || 6379,
+  lazyConnect: true,
 });
 
-export async function setMemory(key: string, value: any) {
-    await redis.set(key, JSON.stringify(value), "EX", 3600);
+redis.on('error', (err) => {
+  console.error('Redis error:', err.message);
+});
+
+export async function setMemory(key: string, value: any, ttl = 3600): Promise<void> {
+  await redis.set(key, JSON.stringify(value), 'EX', ttl);
 }
 
-export async function getMemory(key: string) {
-    const value = await redis.get(key);
+export async function getMemory(key: string): Promise<any> {
+  const raw = await redis.get(key);
+  if (!raw) return null;
+  try {
+    return JSON.parse(raw);
+  } catch {
+    return raw;
+  }
+}
 
-    if (!value) {
-        return null;
-    }
+export async function deleteMemory(key: string): Promise<void> {
+  await redis.del(key);
+}
 
-    return JSON.parse(value);
+export async function setLastTopic(userId: string, topic: string): Promise<void> {
+  await setMemory(`last_topic:${userId}`, topic, 1800);
+}
+
+export async function getLastTopic(userId: string): Promise<string> {
+  return (await getMemory(`last_topic:${userId}`)) || '';
 }
