@@ -361,6 +361,15 @@ async function planAndExecute(
 
 // ─── Response generation ──────────────────────────────────────────────────────
 
+async function withTimeout<T>(promise: Promise<T>, ms: number): Promise<T> {
+  return Promise.race([
+    promise,
+    new Promise<T>((_, reject) =>
+      setTimeout(() => reject(new Error(`AI response timed out after ${ms}ms`)), ms)
+    ),
+  ]);
+}
+
 const model = new ChatOllama({
   baseUrl: process.env.OLLAMA_HOST || 'http://ollama:11434',
   model: process.env.OLLAMA_MODEL || 'llama3',
@@ -409,14 +418,18 @@ ACTIONS I TOOK:
 ${actionsText}
 
 RULES:
-- Never output JSON, code blocks, or tell the user to run commands.
-- Never invent data not shown above.
-- "Up X hours" without (unhealthy)/Exited/Dead/Restarting = HEALTHY.
-- CPU <70%, RAM <80%, Disk <80% are normal.
-- Grafana VPN-only = by design, not a failure.
-- If approval is pending, tell Othman to check the approval message.
-- Always explain what you did and why.
-- Be concise and direct. Max 350 words.
+- Never output JSON, code blocks, or raw tool calls.
+- Never ask the user to run commands.
+- Never invent data not present in LIVE SYSTEM, DOCKER STATUS, SERVICE DATA, or ACTIONS I TOOK.
+- Never claim per-container CPU or RAM unless explicitly provided above.
+- "Up X hours" without "(unhealthy)", "Exited", "Dead", or "Restarting" means the container is running normally.
+- CPU <70%, RAM <80%, Disk <80% are normal operating ranges.
+- Grafana public access is intentionally disabled — public unreachability must be reported as "private/VPN-only", never as "down".
+- Grafana VPN endpoint is http://100.75.253.104:3002/ — use this as the reference.
+- Prometheus is checked internally only, not via public internet.
+- If an approval is pending, clearly state the pending action name so Othman can act on it.
+- Health verdict must be exactly one of: Healthy, Warning, Critical, Unknown.
+- Always explain what you did and why. Be concise and direct. Max 350 words.
 
 FORMAT:
 Health verdict: [Healthy / Warning / Critical / Unknown]
@@ -426,18 +439,39 @@ Pending approval: action name, or "None"
 Next step: one concrete recommendation, or "None needed"`;
 
   try {
-    const response = await model.invoke([{ role: 'user', content: prompt }]);
+    const response = await withTimeout(
+      model.invoke([{ role: 'user', content: prompt }]),
+      30000
+    );
     const text = typeof response.content === 'string'
       ? response.content
       : JSON.stringify(response.content);
     return text.slice(0, 3500);
   } catch (err: any) {
+    const pendingApprovals = actions
+      .filter(a => a.status === 'queued_for_approval')
+      .map(a => a.action)
+      .join(', ') || 'None';
+
+    const executed = actions
+      .filter(a => a.status === 'executed')
+      .map(a => `${a.action}${a.output ? ` → ${a.output}` : ''}`)
+      .join(', ') || 'None';
+
+    const diskOk = systemHealth.diskUsedPercent < 80;
+    const ramOk = systemHealth.ramPercent < 80;
+    const cpuOk = systemHealth.cpu < 70;
+    const verdict = (!cpuOk || !ramOk || !diskOk) ? 'Warning' : 'Healthy';
+
     return [
-      `Actions: ${actionsText}`,
-      serviceContext ? `Context:\n${serviceContext}` : '',
-      `System: CPU ${systemHealth.cpu.toFixed(1)}% | RAM ${systemHealth.ramPercent.toFixed(1)}% | Disk ${systemHealth.diskUsedPercent.toFixed(1)}%`,
-      pastIncidents ? `Past incidents:\n${pastIncidents}` : '',
-    ].filter(Boolean).join('\n\n');
+      `Health verdict: ${verdict}`,
+      `Findings: CPU ${systemHealth.cpu.toFixed(1)}% | RAM ${systemHealth.ramPercent.toFixed(1)}% | Disk ${systemHealth.diskUsedPercent.toFixed(1)}% | Uptime ${systemHealth.uptimeHours}h`,
+      serviceContext ? serviceContext : '',
+      `Actions taken: ${executed}`,
+      `Pending approval: ${pendingApprovals}`,
+      `Next step: ${pendingApprovals !== 'None' ? 'Check the approval message above.' : 'None needed.'}`,
+      `\n_Note: AI response timed out — raw context shown. (${err.message})_`,
+    ].filter(Boolean).join('\n');
   }
 }
 
